@@ -6,7 +6,7 @@ import cv2
 
 class RobotClient:
     def __init__(self):
-        # Hotspot server target IP configuration
+        # change hotspot ip address
         self.laptop_ip = "10.239.162.133"
         self.uri = f"ws://{self.laptop_ip}:8000/ws/robot"
         self.video_uri = f"ws://{self.laptop_ip}:8000/ws/video"
@@ -20,41 +20,59 @@ class RobotClient:
     async def video_stream_loop(self):
         """Captures hardware video frames, compresses them, and streams via WebSockets."""
         while True:
-            # Only stream video if the primary websocket command pipeline is active
             if not self.connected:
                 await asyncio.sleep(1)
                 continue
-                
+            
+            camera = None
+
             try:
                 print("[VIDEO] Connecting to video stream channel...")
                 async with websockets.connect(self.video_uri) as ws:
                     print("[VIDEO] Stream connected successfully!")
                     
                     camera = cv2.VideoCapture(0)
-                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1) # reduce lag
                     
+                    camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    
+                    # delay for sensor to startup
+                    await asyncio.sleep(1.0)
+
+                    # flush corrupt frames
+                    for _ in range(5):
+                        try:
+                            camera.read()
+                        except Exception:
+                            pass
+
                     while self.connected:
-                        success, frame = camera.read()
-                        if not success:
-                            await asyncio.sleep(0.03)
+                        try:
+                            success, frame = camera.read()
+                        except Exception as e:
+                            print(f"[VIDEO WARNING] Dropping corrupted hardware frame: {e}")
+                            await asyncio.sleep(0.05)
                             continue
-                        else:
-                            # Compress frame to JPEG format
-                            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                            
-                            # Ship raw binary frame tokens directly up to your laptop
-                            await ws.send(buffer.tobytes())
-                            
-                            # Cap at 25 FPS
-                            await asyncio.sleep(0.04)
                         
-                    camera.release()
-                    print("[VIDEO] Camera resource released cleanly.")
+                        if not success or frame is None or frame.size == 0:
+                            await asyncio.sleep(0.05)
+                            continue
+                        
+                        # compress to jpeg
+                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                        
+                        await ws.send(buffer.tobytes())
+                        await asyncio.sleep(0.04) # 25fps
                     
             except Exception as e:
                 print(f"[VIDEO ERROR] Stream disconnected: {e}. Retrying in 2 seconds...")
                 await asyncio.sleep(2)
+            finally:
+                if camera is not None:
+                    camera.release()
+                    print("[VIDEO] Camera resource released cleanly.")
 
     def reset_commands_on_disconnect(self):
         """Locally set the last command to zero upon disconnect (motor safety)."""
@@ -111,7 +129,6 @@ class RobotClient:
         backoff = 1
         max_backoff = 8
 
-        # 🚀 CRITICAL FIX: Spin up the video routine as a concurrent background task!
         asyncio.create_task(self.video_stream_loop())
 
         while True:
@@ -122,11 +139,9 @@ class RobotClient:
                     self.connected = True
                     backoff = 1  
 
-                    # Fire off standard UI data tracking tasks concurrently
                     telemetry_task = asyncio.create_task(self.telemetry_loop(websocket))
                     receive_task = asyncio.create_task(self.receive_loop(websocket))
 
-                    # Monitor connection state
                     done, pending = await asyncio.wait(
                         [telemetry_task, receive_task],
                         return_when=asyncio.FIRST_COMPLETED
