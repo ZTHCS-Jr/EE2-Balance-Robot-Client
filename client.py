@@ -7,7 +7,7 @@ import cv2
 class RobotClient:
     def __init__(self):
         # Hotspot server target IP configuration
-        self.laptop_ip = "10.239.162.133"
+        self.laptop_ip = "10.118.30.34"
         self.uri = f"ws://{self.laptop_ip}:8000/ws/robot"
         self.video_uri = f"ws://{self.laptop_ip}:8000/ws/video"
         
