@@ -1,21 +1,48 @@
-import asyncio
+﻿import asyncio
 import json
 import os
 
 import serial
 import websockets
 
-SERVER_URL = os.environ.get("SERVER_URL", "ws://10.130.108.34:8000")
+SERVER_URL = os.environ.get("SERVER_URL", "ws://10.22.179.34:8001")
 SERIAL_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
 BAUD_RATE = int(os.environ.get("BAUD_RATE", "115200"))
 
+_DEAD_ZONE = 0.1
+_FWD_MIN, _FWD_MAX = 2.0, 7.0
+_BWD_MIN, _BWD_MAX = -4.0, -9.0
+_MAX_TURN = 4.0
+
+
+def map_velocity(y: float) -> float:
+    if abs(y) < _DEAD_ZONE:
+        return 0.0
+    if y > 0:
+        t = (y - _DEAD_ZONE) / (1.0 - _DEAD_ZONE)
+        return _FWD_MIN + t * (_FWD_MAX - _FWD_MIN)
+    else:
+        t = (abs(y) - _DEAD_ZONE) / (1.0 - _DEAD_ZONE)
+        return _BWD_MIN + t * (_BWD_MAX - _BWD_MIN)
+
 
 async def receive_commands(ws, ser):
-    """Forward <linear,angular> commands from the server to the ESP over serial."""
+    """Receive <linear,angular> from server, map and forward to ESP32."""
     async for message in ws:
-        if isinstance(message, str) and message.startswith('<'):
-            print(f"[CMD → ESP] {message}")
-            ser.write(message.encode())
+        if not (isinstance(message, str) and message.startswith('<') and message.endswith('>')):
+            continue
+        try:
+            lin_str, ang_str = message[1:-1].split(',', 1)
+            vel = map_velocity(-float(lin_str))   # negated: joystick forward = correct direction
+            angular = float(ang_str) * _MAX_TURN
+        except ValueError:
+            print(f"[WARN] Could not parse command: {message!r}")
+            continue
+        v_cmd = f"V:{vel:.2f}\n"
+        a_cmd = f"A:{angular:.2f}\n"
+        print(f"[CMD -> ESP] {message!r} -> {v_cmd!r} {a_cmd!r}")
+        ser.write(v_cmd.encode())
+        ser.write(a_cmd.encode())
 
 
 async def read_telemetry(ws, ser):
@@ -31,7 +58,7 @@ async def read_telemetry(ws, ser):
                 continue
             try:
                 payload = json.loads(line)
-                print(f"[TELEMETRY ← ESP] {payload}")
+                print(f"[TELEMETRY <- ESP] {payload}")
                 await ws.send(json.dumps(payload))
             except json.JSONDecodeError:
                 print(f"[WARN] Non-JSON from ESP: {line!r}")
@@ -45,7 +72,11 @@ async def run():
     while True:
         try:
             print(f"[CONNECTING] {SERVER_URL}/ws/robot ...")
-            async with websockets.connect(f"{SERVER_URL}/ws/robot") as ws:
+            async with websockets.connect(
+                f"{SERVER_URL}/ws/robot",
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
                 print("[CONNECTED] WebSocket established.")
                 backoff = 1
                 await asyncio.gather(

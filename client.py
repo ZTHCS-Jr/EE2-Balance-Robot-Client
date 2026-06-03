@@ -3,11 +3,15 @@ import websockets
 import json
 import time
 import cv2
+from picamera2 import Picamera2
+import os
+import serial
+
 
 class RobotClient:
     def __init__(self):
         # Hotspot server target IP configuration
-        self.laptop_ip = "10.118.30.34"
+        self.laptop_ip = "10.245.27.34"
         self.uri = f"ws://{self.laptop_ip}:8000/ws/robot"
         self.video_uri = f"ws://{self.laptop_ip}:8000/ws/video"
         
@@ -16,6 +20,23 @@ class RobotClient:
         self.last_angular = 0.0
         self.last_command_time = 0.0
         self.connected = False
+        self.SERIAL_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
+        self.BAUD_RATE = int(os.environ.get("BAUD_RATE", "115200"))
+
+        self._DEAD_ZONE = 0.1
+        self._FWD_MIN, self._FWD_MAX = 2.0, 7.0
+        self._BWD_MIN, self._BWD_MAX = -4.0, -9.0
+        self._MAX_TURN = 4.0
+        
+    def map_velocity(self, y: float) -> float:
+        if abs(y) < self._DEAD_ZONE:
+            return 0.0
+        if y > 0:
+            t = (y - self._DEAD_ZONE) / (1.0 - self._DEAD_ZONE)
+            return self._FWD_MIN + t * (self._FWD_MAX - self._FWD_MIN)
+        else:
+            t = (abs(y) - self._DEAD_ZONE) / (1.0 - self._DEAD_ZONE)
+            return self._BWD_MIN + t * (self._BWD_MAX - self._BWD_MIN)
     
     async def video_stream_loop(self):
         """Captures hardware video frames, compresses them, and streams via WebSockets."""
@@ -30,41 +51,34 @@ class RobotClient:
                 print("[VIDEO] Connecting to video stream channel...")
                 async with websockets.connect(self.video_uri) as ws:
                     print("[VIDEO] Stream connected successfully!")
-                    
-                    camera = cv2.VideoCapture(0)
-                    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1) # reduce lag
-                    
-                    camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    
-                    # delay for sensor to startup
-                    await asyncio.sleep(1.0)
 
-                    # flush corrupt frames
-                    for _ in range(5):
-                        try:
-                            camera.read()
-                        except Exception:
-                            pass
+                    camera = Picamera2()
+                    config = camera.create_video_configuration(
+                        main={"size": (1000, 1000), "format": "RGB888"}
+                    )
+                    camera.configure(config)
+                    camera.start()
+                    await asyncio.sleep(1.0)  # sensor warm-up
 
                     while self.connected:
                         try:
-                            success, frame = camera.read()
+                            frame = await asyncio.to_thread(camera.capture_array)
                         except Exception as e:
                             print(f"[VIDEO WARNING] Dropping corrupted hardware frame: {e}")
-                            await asyncio.sleep(0.05)
+                            await asyncio.sleep(0.01)
                             continue
-                        
-                        if not success or frame is None or frame.size == 0:
-                            await asyncio.sleep(0.05)
+
+                        if frame is None or frame.size == 0:
+                            await asyncio.sleep(0.02)
                             continue
-                        
-                        # compress to jpeg
-                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                        
+
+                        # NoIR -> grayscale, then JPEG-encode and send
+                        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        _, buffer = cv2.imencode('.jpg', gray_frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+
                         await ws.send(buffer.tobytes())
-                        await asyncio.sleep(0.04) # 25fps
+                        await asyncio.sleep(0)
+
                     
             except Exception as e:
                 print(f"[VIDEO ERROR] Stream disconnected: {e}. Retrying in 2 seconds...")
@@ -101,33 +115,29 @@ class RobotClient:
                 break
                 
             await asyncio.sleep(1)
-
-    async def receive_loop(self, websocket):
-        """Listens for incoming joystick commands formatted as '<linear,angular>'."""
-        try:
-            async for message in websocket:
-                if message.startswith('<') and message.endswith('>'):
-                    inner_content = message[1:-1]
-                    try:
-                        lin_str, ang_str = inner_content.split(',')
-                        self.last_linear = float(lin_str)
-                        self.last_angular = float(ang_str)
-                        self.last_command_time = time.time()
-                        
-                        print(f"[COMMAND RECV] Linear: {self.last_linear:.2f} | Angular: {self.last_angular:.2f}")
-                        
-                    except ValueError:
-                        print(f"[ERROR] Failed to parse command floats: {message}")
-                else:
-                    print(f"[WARNING] Unrecognized message format received: {message}")
-                    
-        except websockets.exceptions.ConnectionClosed:
-            print(f"[CLOSED] WebSocket connection closed in receive loop")
+            
+    async def receive_and_send(self, websocket, ser):
+        # Receive <linear,angular> from server, map to our required ranges and forward to ESP32
+        async for message in websocket:
+            try:
+                linear_v_str, angular_v_str = message[1:-1].split(',', 1)
+                vel = self.map_velocity(-float(linear_v_str))   # negative so that our direction is correct
+                angular = float(angular_v_str) * self._MAX_TURN
+            except ValueError:
+                print(f"[WARN] Could not parse command: {message!r}")
+                continue
+            v_cmd = f"V:{vel:.2f}\n"
+            a_cmd = f"A:{angular:.2f}\n"
+            print(f"[CMD -> ESP] {message!r} -> {v_cmd!r} {a_cmd!r}")
+            ser.write(v_cmd.encode())
+            ser.write(a_cmd.encode())
 
     async def run(self):
         """Main engine loop handling auto-reconnect and task scheduling."""
         backoff = 1
         max_backoff = 8
+        ser = serial.Serial(self.SERIAL_PORT, self.BAUD_RATE, timeout=0.1)
+        print(f"[SERIAL] Opened {self.SERIAL_PORT} @ {self.BAUD_RATE} baud")
 
         asyncio.create_task(self.video_stream_loop())
 
@@ -140,16 +150,25 @@ class RobotClient:
                     backoff = 1  
 
                     telemetry_task = asyncio.create_task(self.telemetry_loop(websocket))
-                    receive_task = asyncio.create_task(self.receive_loop(websocket))
+                    receive_task = asyncio.create_task(self.receive_and_send(websocket, ser))
 
                     done, pending = await asyncio.wait(
                         [telemetry_task, receive_task],
-                        return_when=asyncio.FIRST_COMPLETED
+                        return_when=asyncio.FIRST_EXCEPTION
                     )
 
                     self.connected = False
+                    # Cancel whichever task is still running 
                     for task in pending:
                         task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+
+                    # Raise any exceptions
+                    for task in done:
+                        exc = task.exception()
+                        if exc is not None:
+                            raise exc
 
             except (websockets.exceptions.ConnectionClosedError, ConnectionRefusedError, OSError) as e:
                 self.connected = False
