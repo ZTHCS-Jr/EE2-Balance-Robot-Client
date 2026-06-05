@@ -6,28 +6,38 @@ import cv2
 from picamera2 import Picamera2
 import os
 import serial
-
+import math
+import sys
+import socket
 
 class RobotClient:
-    def __init__(self):
-        # Hotspot server target IP configuration
-        self.laptop_ip = "10.245.27.34"
+    def __init__(self):        
+        # Base Station configuration
+        self.laptop_ip = "10.144.216.133"
         self.uri = f"ws://{self.laptop_ip}:8000/ws/robot"
         self.video_uri = f"ws://{self.laptop_ip}:8000/ws/video"
         
-        # Shared state
+        # UDP Configuration
+        self.udp_port = 31415
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        self.connected = False
+        
+        # Serial Configs
+        self.ESP_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
+        self.ESP_BAUD = int(os.environ.get("BAUD_RATE", "115200"))
+        self.LIDAR_PORT = '/dev/serial0'
+        self.LIDAR_BAUD = 230400
+
+        # Motor State
         self.last_linear = 0.0
         self.last_angular = 0.0
         self.last_command_time = 0.0
-        self.connected = False
-        self.SERIAL_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
-        self.BAUD_RATE = int(os.environ.get("BAUD_RATE", "115200"))
-
         self._DEAD_ZONE = 0.1
         self._FWD_MIN, self._FWD_MAX = 2.0, 7.0
         self._BWD_MIN, self._BWD_MAX = -4.0, -9.0
         self._MAX_TURN = 4.0
-        
+
     def map_velocity(self, y: float) -> float:
         if abs(y) < self._DEAD_ZONE:
             return 0.0
@@ -37,7 +47,78 @@ class RobotClient:
         else:
             t = (abs(y) - self._DEAD_ZONE) / (1.0 - self._DEAD_ZONE)
             return self._BWD_MIN + t * (self._BWD_MAX - self._BWD_MIN)
-    
+
+    def parse_lidar_packet(self, packet):
+        if len(packet) != 47 or packet[0] != 0x54 or packet[1] != 0x2C:
+            return []
+        
+        startAngle = (packet[5] << 8 | packet[4]) / 100.0
+        endAngle = (packet[43] << 8 | packet[42]) / 100.0
+
+        step = (360 - (startAngle - endAngle)) / 11.0 if endAngle < startAngle else (endAngle - startAngle) / 11.0
+
+        points = []
+        for i in range(12):
+            base = 6 + (i * 3) 
+            distance = packet[base+1] << 8 | packet[base]
+            intensity = packet[base+2]
+            angle = startAngle + step * i
+            if angle >= 360.0: angle -= 360.0
+            points.append((math.radians(angle), distance, intensity))
+
+        return points
+
+    async def esp32_sensor_loop(self, ser):
+        """Continuously reads IMU/motor and sends via udp, independent of websockets."""
+        while True:
+            if ser.in_waiting > 0:
+                try:
+                    raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    if raw_line.startswith("IMU:"):
+                        latest_gyro_x = float(raw_line.split(":")[1])
+                        payload = { "imu": { "gyro_x": latest_gyro_x } }
+                        self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
+                        
+                    elif raw_line.startswith("MOTOR:"):
+                        parts = raw_line.split(":")[1].split(",")
+                        left_steps, right_steps = int(parts[0]), int(parts[1])
+                        payload = { "odom": { "left_steps": left_steps, "right_steps": right_steps } }
+                        self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
+                except (ValueError, IndexError):
+                    pass 
+            
+            # Yield to event loop to prevent blocking video/commands
+            await asyncio.sleep(0.005)
+
+    async def lidar_sensor_loop(self, lidar_ser):
+        """Continuously reads LIDAR and sends via udp, independent of websockets."""
+        scanData = {}
+        packetsRead = 0
+
+        while True:
+            if lidar_ser.in_waiting >= 47:
+                first_byte = lidar_ser.read(1)
+                if first_byte and first_byte[0] == 0x54:
+                    remaining = lidar_ser.read(46)
+                    if len(remaining) == 46:
+                        packet = bytes([0x54]) + remaining
+                        points = self.parse_lidar_packet(packet)
+                        
+                        for angle, radius, intensity in points:
+                            if 0 < radius < 2000 and intensity >= 30:
+                                deg = int(math.degrees(angle))
+                                scanData[deg] = (angle, radius)
+                        packetsRead += 1
+
+                        if packetsRead >= 150:
+                            payload = { "lidar": scanData }
+                            self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
+                            scanData = {}
+                            packetsRead = 0
+            
+            await asyncio.sleep(0.01)
+
     async def video_stream_loop(self):
         """Captures hardware video frames, compresses them, and streams via WebSockets."""
         while True:
@@ -115,31 +196,43 @@ class RobotClient:
                 break
                 
             await asyncio.sleep(1)
-            
+
     async def receive_and_send(self, websocket, ser):
-        # Receive <linear,angular> from server, map to our required ranges and forward to ESP32
+        """Receives velocity commands via WebSocket and writes to ESP32."""
         async for message in websocket:
             try:
                 linear_v_str, angular_v_str = message[1:-1].split(',', 1)
-                vel = self.map_velocity(-float(linear_v_str))   # negative so that our direction is correct
+                vel = self.map_velocity(-float(linear_v_str))
                 angular = float(angular_v_str) * self._MAX_TURN
+                
+                v_cmd = f"V:{vel:.2f}\n"
+                a_cmd = f"A:{angular:.2f}\n"
+                
+                ser.write(v_cmd.encode())
+                ser.write(a_cmd.encode())
             except ValueError:
                 print(f"[WARN] Could not parse command: {message!r}")
-                continue
-            v_cmd = f"V:{vel:.2f}\n"
-            a_cmd = f"A:{angular:.2f}\n"
-            print(f"[CMD -> ESP] {message!r} -> {v_cmd!r} {a_cmd!r}")
-            ser.write(v_cmd.encode())
-            ser.write(a_cmd.encode())
 
     async def run(self):
-        """Main engine loop handling auto-reconnect and task scheduling."""
         backoff = 1
         max_backoff = 8
-        ser = serial.Serial(self.SERIAL_PORT, self.BAUD_RATE, timeout=0.1)
-        print(f"[SERIAL] Opened {self.SERIAL_PORT} @ {self.BAUD_RATE} baud")
+        try:
+            esp_ser = serial.Serial(self.ESP_PORT, self.ESP_BAUD, timeout=0.1)
+            print(f"[SERIAL] Opened esp32 {self.ESP_PORT}")
+        except Exception as e:
+            print(f"[ERROR] Failed to open serial: {e}")
+            sys.exit(1)
+
+        try:
+            lidar_ser = serial.Serial(self.LIDAR_PORT, self.LIDAR_BAUD, timeout=0.1)
+            print(f"[SERIAL] Opened LiDAR {self.LIDAR_PORT}")
+        except Exception as e:
+            print(f"[ERROR] Failed to open LiDAR serial: {e}")
+            sys.exit(1)
 
         asyncio.create_task(self.video_stream_loop())
+        asyncio.create_task(self.esp32_sensor_loop(esp_ser))
+        asyncio.create_task(self.lidar_sensor_loop(lidar_ser))
 
         while True:
             try:
@@ -150,7 +243,7 @@ class RobotClient:
                     backoff = 1  
 
                     telemetry_task = asyncio.create_task(self.telemetry_loop(websocket))
-                    receive_task = asyncio.create_task(self.receive_and_send(websocket, ser))
+                    receive_task = asyncio.create_task(self.receive_and_send(websocket, esp_ser))
 
                     done, pending = await asyncio.wait(
                         [telemetry_task, receive_task],
@@ -158,13 +251,11 @@ class RobotClient:
                     )
 
                     self.connected = False
-                    # Cancel whichever task is still running 
                     for task in pending:
                         task.cancel()
                     if pending:
                         await asyncio.gather(*pending, return_exceptions=True)
 
-                    # Raise any exceptions
                     for task in done:
                         exc = task.exception()
                         if exc is not None:
