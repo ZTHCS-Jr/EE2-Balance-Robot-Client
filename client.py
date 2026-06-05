@@ -13,7 +13,7 @@ import socket
 class RobotClient:
     def __init__(self):        
         # Base Station configuration
-        self.laptop_ip = "10.144.216.133"
+        self.laptop_ip = "10.245.27.34"
         self.uri = f"ws://{self.laptop_ip}:8000/ws/robot"
         self.video_uri = f"ws://{self.laptop_ip}:8000/ws/video"
         
@@ -34,9 +34,9 @@ class RobotClient:
         self.last_angular = 0.0
         self.last_command_time = 0.0
         self._DEAD_ZONE = 0.1
-        self._FWD_MIN, self._FWD_MAX = 2.0, 7.0
-        self._BWD_MIN, self._BWD_MAX = -4.0, -9.0
-        self._MAX_TURN = 4.0
+        self._FWD_MIN, self._FWD_MAX = 2.0, 5.0
+        self._BWD_MIN, self._BWD_MAX = -4.0, -7.0
+        self._MAX_TURN = 2.0
 
     def map_velocity(self, y: float) -> float:
         if abs(y) < self._DEAD_ZONE:
@@ -69,21 +69,30 @@ class RobotClient:
         return points
 
     async def esp32_sensor_loop(self, ser):
-        """Continuously reads IMU/motor and sends via udp, independent of websockets."""
+        """Continuously reads ESP32 odom/IMU telemetry and forwards via UDP.
+
+        The ESP32 emits one consolidated line at ~50 Hz:
+            ODOM:<t_ms>,<left_steps>,<right_steps>,<yaw_rate_rad_s>
+        left/right are signed absolute microstep counts; yaw_rate is rad/s.
+        Forwarding the timestamp lets the ROS side derive dt and tolerate dropped
+        UDP packets (absolute counts self-heal across drops).
+        """
         while True:
             if ser.in_waiting > 0:
                 try:
                     raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
                     
-                    if raw_line.startswith("IMU:"):
-                        latest_gyro_x = float(raw_line.split(":")[1])
-                        payload = { "imu": { "gyro_x": latest_gyro_x } }
-                        self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
-                        
-                    elif raw_line.startswith("MOTOR:"):
-                        parts = raw_line.split(":")[1].split(",")
-                        left_steps, right_steps = int(parts[0]), int(parts[1])
-                        payload = { "odom": { "left_steps": left_steps, "right_steps": right_steps } }
+                    if raw_line.startswith("ODOM:"):
+                        parts = raw_line.split(":", 1)[1].split(",")
+                        t_ms = int(parts[0])
+                        left_steps, right_steps = int(parts[1]), int(parts[2])
+                        yaw_rate = float(parts[3])
+                        payload = { "odom": {
+                            "t_ms": t_ms,
+                            "left_steps": left_steps,
+                            "right_steps": right_steps,
+                            "yaw_rate": yaw_rate,
+                        } }
                         self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
                 except (ValueError, IndexError):
                     pass 
@@ -92,32 +101,43 @@ class RobotClient:
             await asyncio.sleep(0.005)
 
     async def lidar_sensor_loop(self, lidar_ser):
-        """Continuously reads LIDAR and sends via udp, independent of websockets."""
+        """Continuously reads LIDAR and sends via udp, independent of websockets.
+
+        Drains the whole serial buffer each pass and emits one UDP scan per ~full
+        revolution (~40 LD19 packets), so /scan refreshes at the lidar's ~10 Hz spin
+        rate instead of a slow trickle. The previous code slept 10 ms after every
+        single packet (capping throughput at ~100 packets/s, below the lidar's output)
+        and batched 150 packets/scan (~0.7 Hz, motion-smeared). Yields only when the
+        buffer is empty, so video/commands are never starved.
+        """
         scanData = {}
         packetsRead = 0
+        PACKETS_PER_SCAN = 40   # ~one LD19 revolution (~38 packets at 10 Hz)
 
         while True:
-            if lidar_ser.in_waiting >= 47:
+            # Drain everything currently buffered without yielding per packet.
+            while lidar_ser.in_waiting >= 47:
                 first_byte = lidar_ser.read(1)
                 if first_byte and first_byte[0] == 0x54:
                     remaining = lidar_ser.read(46)
                     if len(remaining) == 46:
                         packet = bytes([0x54]) + remaining
                         points = self.parse_lidar_packet(packet)
-                        
+
                         for angle, radius, intensity in points:
-                            if 0 < radius < 2000 and intensity >= 30:
+                            if 0 < radius < 8000 and intensity >= 30:
                                 deg = int(math.degrees(angle))
                                 scanData[deg] = (angle, radius)
                         packetsRead += 1
 
-                        if packetsRead >= 150:
+                        if packetsRead >= PACKETS_PER_SCAN:
                             payload = { "lidar": scanData }
                             self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
                             scanData = {}
                             packetsRead = 0
-            
-            await asyncio.sleep(0.01)
+
+            # Buffer drained; yield briefly so other coroutines run.
+            await asyncio.sleep(0.005)
 
     async def video_stream_loop(self):
         """Captures hardware video frames, compresses them, and streams via WebSockets."""
