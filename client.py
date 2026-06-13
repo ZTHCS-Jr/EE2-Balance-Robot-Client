@@ -10,6 +10,8 @@ import math
 import sys
 import socket
 
+LATENCY_PROBE = True  # set False to disable the latency pong echo
+
 class RobotClient:
     def __init__(self):        
         # Base Station configuration
@@ -20,6 +22,15 @@ class RobotClient:
         # UDP Configuration
         self.udp_port = 31415
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Autonomous command input (UDP -> ESP32 V:/A:), separate from telemetry.
+        self.cmd_port = int(os.environ.get("CMD_PORT", "31416")) # listens for high-speed
+        self.cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cmd_sock.bind(("0.0.0.0", self.cmd_port))
+        self.cmd_sock.setblocking(False)
+        self.WHEEL_RADIUS = 0.033
+        self.WHEEL_BASE = 0.116
+        self._last_cmd_time = 0.0
         
         self.connected = False
         
@@ -34,8 +45,8 @@ class RobotClient:
         self.last_angular = 0.0
         self.last_command_time = 0.0
         self._DEAD_ZONE = 0.1
-        self._FWD_MIN, self._FWD_MAX = 2.0, 5.0
-        self._BWD_MIN, self._BWD_MAX = -4.0, -7.0
+        self._FWD_MIN, self._FWD_MAX = 2.0, 7.0
+        self._BWD_MIN, self._BWD_MAX = -2.0, -7.0
         self._MAX_TURN = 2.0
 
     def map_velocity(self, y: float) -> float:
@@ -87,11 +98,13 @@ class RobotClient:
                         t_ms = int(parts[0])
                         left_steps, right_steps = int(parts[1]), int(parts[2])
                         yaw_rate = float(parts[3])
+                        pitch = float(parts[4]) if len(parts) > 4 else 0.0
                         payload = { "odom": {
                             "t_ms": t_ms,
                             "left_steps": left_steps,
                             "right_steps": right_steps,
                             "yaw_rate": yaw_rate,
+                            "pitch": pitch,
                         } }
                         self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
                 except (ValueError, IndexError):
@@ -139,6 +152,15 @@ class RobotClient:
             # Buffer drained; yield briefly so other coroutines run.
             await asyncio.sleep(0.005)
 
+    @staticmethod
+    def _encode_frame(frame):
+        """NoIR frame -> grayscale -> JPEG bytes. CPU-bound, so run it via
+        asyncio.to_thread: inline it would block the event loop and starve the LiDAR
+        serial drain, making /scan lag the gyro (the rotation-doubling cause)."""
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, buffer = cv2.imencode('.jpg', gray_frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        return buffer
+
     async def video_stream_loop(self):
         """Captures hardware video frames, compresses them, and streams via WebSockets."""
         while True:
@@ -173,9 +195,11 @@ class RobotClient:
                             await asyncio.sleep(0.02)
                             continue
 
-                        # NoIR -> grayscale, then JPEG-encode and send
-                        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        _, buffer = cv2.imencode('.jpg', gray_frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                        # Compress OFF the event loop: cvtColor + imencode are CPU-heavy and,
+                        # run inline, block asyncio -> starve the LiDAR serial drain so /scan
+                        # lags the gyro (the rotation-doubling cause). to_thread keeps the loop
+                        # free, so lidar/odom/cmd stay low-latency even while video streams.
+                        buffer = await asyncio.to_thread(self._encode_frame, frame)
 
                         await ws.send(buffer.tobytes())
                         await asyncio.sleep(0)
@@ -202,9 +226,11 @@ class RobotClient:
             telemetry = {
                 "type": "telemetry",
                 "timestamp": int(time.time() * 1000),
-                "battery_capacity": 60,    
-                "power_consumption": 12.4, 
-                "imu_angle": 0.2,        
+                "battery_capacity": self.battery_soc,
+                "power_consumption": self.power_watts,
+                "battery_voltage": self.battery_volts,
+                "battery_amps": self.battery_amps,
+                "imu_angle": self.current_pitch,
                 "last_linear": self.last_linear,
                 "last_angular": self.last_angular
             }
@@ -217,9 +243,20 @@ class RobotClient:
                 
             await asyncio.sleep(1)
 
+    # listens to websocket for joystick commands
     async def receive_and_send(self, websocket, ser):
         """Receives velocity commands via WebSocket and writes to ESP32."""
         async for message in websocket:
+            if LATENCY_PROBE and message.startswith("{"):
+                # Latency probe: echo a pong straight back (browser<->Pi round trip).
+                try:
+                    obj = json.loads(message)
+                except ValueError:
+                    continue
+                if obj.get("type") == "ping":
+                    obj["type"] = "pong"
+                    await websocket.send(json.dumps(obj))
+                continue
             try:
                 linear_v_str, angular_v_str = message[1:-1].split(',', 1)
                 vel = self.map_velocity(-float(linear_v_str))
@@ -232,6 +269,47 @@ class RobotClient:
                 ser.write(a_cmd.encode())
             except ValueError:
                 print(f"[WARN] Could not parse command: {message!r}")
+
+    # listens via UDP for autonomous control commands
+    async def cmd_listener_loop(self, ser):
+        """Autonomous velocity commands over UDP -> ESP32 V:/A:, with a deadman.
+
+        Accepts {"v": <m/s>, "w": <rad/s>} on UDP cmd_port and converts to the
+        stepper units the firmware expects:
+            V = v / wheel_radius            (TARGET_VELOCITY, stepper rad/s)
+            A = w * wheel_base / (2 * r)    (ANGULAR_VEL,     stepper rad/s)
+        If no command arrives for CMD_TIMEOUT seconds, sends V:0/A:0 so the robot
+        halts if the explorer/bridge dies. The deadman only arms after autonomous
+        control has been active, so it never fights the manual joystick path.
+        """
+        CMD_TIMEOUT = 0.5
+        stopped = True
+        while True:
+            while True:
+                try:
+                    data, _ = self.cmd_sock.recvfrom(1024)
+                except BlockingIOError:
+                    break
+                try:
+                    obj = json.loads(data.decode("utf-8"))
+                    v = float(obj.get("v", 0.0))
+                    w = float(obj.get("w", 0.0))
+                except (ValueError, TypeError):
+                    continue
+                V = v / self.WHEEL_RADIUS
+                A = w * self.WHEEL_BASE / (2.0 * self.WHEEL_RADIUS)
+                ser.write(f"V:{V:.3f}\n".encode())
+                ser.write(f"A:{A:.3f}\n".encode())
+                self._last_cmd_time = time.time()
+                stopped = False
+
+            # Deadman: stop the robot if commands stop arriving.
+            if not stopped and (time.time() - self._last_cmd_time) > CMD_TIMEOUT:
+                ser.write(b"V:0\n")
+                ser.write(b"A:0\n")
+                stopped = True
+
+            await asyncio.sleep(0.02)
 
     async def run(self):
         backoff = 1
@@ -253,6 +331,7 @@ class RobotClient:
         asyncio.create_task(self.video_stream_loop())
         asyncio.create_task(self.esp32_sensor_loop(esp_ser))
         asyncio.create_task(self.lidar_sensor_loop(lidar_ser))
+        asyncio.create_task(self.cmd_listener_loop(esp_ser))
 
         while True:
             try:
