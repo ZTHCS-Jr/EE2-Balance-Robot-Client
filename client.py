@@ -15,7 +15,7 @@ LATENCY_PROBE = True  # set False to disable the latency pong echo
 class RobotClient:
     def __init__(self):        
         # Base Station configuration
-        self.laptop_ip = "10.245.27.34"
+        self.laptop_ip = "192.168.0.20"
         self.uri = f"ws://{self.laptop_ip}:8000/ws/robot"
         self.video_uri = f"ws://{self.laptop_ip}:8000/ws/video"
         
@@ -48,6 +48,12 @@ class RobotClient:
         self._FWD_MIN, self._FWD_MAX = 2.0, 7.0
         self._BWD_MIN, self._BWD_MAX = -2.0, -7.0
         self._MAX_TURN = 2.0
+
+        self.battery_soc = 100.0
+        self.power_watts = 0.0
+        self.battery_volts = 0.0
+        self.battery_amps = 0.0
+        self.current_pitch = 0.0
 
     def map_velocity(self, y: float) -> float:
         if abs(y) < self._DEAD_ZONE:
@@ -99,12 +105,26 @@ class RobotClient:
                         left_steps, right_steps = int(parts[1]), int(parts[2])
                         yaw_rate = float(parts[3])
                         pitch = float(parts[4]) if len(parts) > 4 else 0.0
+                        self.current_pitch=pitch
                         payload = { "odom": {
                             "t_ms": t_ms,
                             "left_steps": left_steps,
                             "right_steps": right_steps,
                             "yaw_rate": yaw_rate,
                             "pitch": pitch,
+                        } }
+                        self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
+                    elif raw_line.startswith("POWER:"):
+                        parts = raw_line.split(":", 1)[1].split(",")
+                        self.battery_volts = float(parts[0])
+                        self.battery_amps = float(parts[1])
+                        self.power_watts = float(parts[2])
+                        self.battery_soc = float(parts[3])
+                        payload = { "power": {
+                            "volts": self.battery_volts,
+                            "amps": self.battery_amps,
+                            "watts": self.power_watts,
+                            "soc": self.battery_soc
                         } }
                         self.udp_sock.sendto(json.dumps(payload).encode("utf-8"), (self.laptop_ip, self.udp_port))
                 except (ValueError, IndexError):
