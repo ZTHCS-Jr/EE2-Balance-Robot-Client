@@ -312,6 +312,13 @@ class RobotClient:
                     break
                 try:
                     obj = json.loads(data.decode("utf-8"))
+                    if "audio" in obj:
+                        if obj["audio"] == "registered":
+                            os.system("play registered.wav vol 5.0 &")
+                        elif obj["audio"] == "unregistered":
+                            os.system("play not_registered.wav vol 5.0 &")
+                        else:
+                            continue
                     v = float(obj.get("v", 0.0))
                     w = float(obj.get("w", 0.0))
                 except (ValueError, TypeError):
