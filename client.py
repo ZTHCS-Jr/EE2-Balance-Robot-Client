@@ -10,8 +10,6 @@ import math
 import sys
 import socket
 
-LATENCY_PROBE = True  # set False to disable the latency pong echo
-
 class RobotClient:
     def __init__(self):        
         # Base Station configuration
@@ -267,16 +265,6 @@ class RobotClient:
     async def receive_and_send(self, websocket, ser):
         """Receives velocity commands via WebSocket and writes to ESP32."""
         async for message in websocket:
-            if LATENCY_PROBE and message.startswith("{"):
-                # Latency probe: echo a pong straight back (browser<->Pi round trip).
-                try:
-                    obj = json.loads(message)
-                except ValueError:
-                    continue
-                if obj.get("type") == "ping":
-                    obj["type"] = "pong"
-                    await websocket.send(json.dumps(obj))
-                continue
             try:
                 linear_v_str, angular_v_str = message[1:-1].split(',', 1)
                 vel = self.map_velocity(-float(linear_v_str))
