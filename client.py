@@ -13,7 +13,11 @@ import socket
 class RobotClient:
     def __init__(self):        
         # Base Station configuration
-        self.laptop_ip = "192.168.0.20"
+        # self.laptop_ip = "192.168.0.20"
+        self.laptop_ip = "10.232.9.133"
+        # self.laptop_ip = "10.232.9.141" # T laptop with S hotspot
+        # self.laptop_ip = "10.72.213.141"
+        # self.laptop_ip="10.72.213.133"
         self.uri = f"ws://{self.laptop_ip}:8000/ws/robot"
         self.video_uri = f"ws://{self.laptop_ip}:8000/ws/video"
         
@@ -301,10 +305,12 @@ class RobotClient:
                 try:
                     obj = json.loads(data.decode("utf-8"))
                     if "audio" in obj:
-                        if obj["audio"] == "registered":
-                            os.system("play registered.wav vol 5.0 &")
-                        elif obj["audio"] == "unregistered":
-                            os.system("play not_registered.wav vol 5.0 &")
+                        # default english
+                        language=obj.get("language","English")
+                        if obj["audio"]=="registered":
+                            os.system(f"play 'Registered- {language}.wav' vol 5.0 &")
+                        elif obj["audio"]=="unregistered":
+                            os.system(f"play 'Not registered- {language}.wav' vol 5.0 &")
                         else:
                             continue
                     v = float(obj.get("v", 0.0))
